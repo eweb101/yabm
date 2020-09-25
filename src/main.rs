@@ -44,6 +44,7 @@ fn create_temp_file(file_name: &str) -> Result<File,String> {
 }
 
 fn do_backup(temp_file: File, user: &str,mysql_host: &str) -> Result<(),String> {
+    log::debug!("mysqldump started");
     let mut backup = Command::new("mysqldump")
     .arg("-y")
     .arg("-h")
@@ -58,16 +59,6 @@ fn do_backup(temp_file: File, user: &str,mysql_host: &str) -> Result<(),String> 
     .map_err(|e| format!("Error spawning mysqldump:{}",e.to_string()))?;
 
 
-    if let Some(ref mut backup_err) = backup.stderr {
-        let mut reader = BufReader::new(backup_err);
-
-        let mut line = String::new();
-        let len = reader.read_line(&mut line).map_err(|e| format!("error reading stderr:{}
-",e.to_string()))?;
-        if len > 0 {
-            log::error!("{}",line);
-        }
-    }
         
 
     if let Some(backup_output) = backup.stdout.take() {
@@ -80,6 +71,17 @@ fn do_backup(temp_file: File, user: &str,mysql_host: &str) -> Result<(),String> 
         if !compress.success() {
             log::error!("gzip command failed");
             return Err("gzip command failed".to_string());
+        }
+    }
+
+    if let Some(ref mut backup_err) = backup.stderr {
+        let mut reader = BufReader::new(backup_err);
+
+        let mut line = String::new();
+        let len = reader.read_line(&mut line).map_err(|e| format!("error reading stderr:{}
+",e.to_string()))?;
+        if len > 0 {
+            log::error!("{}",line);
         }
     }
 
@@ -109,13 +111,10 @@ fn cp_temp_to_aws(file_name: &str, aws_url: &str) -> Result<(),String> {
 
     log::debug!("Uploaded {} to aws",file_name);
 
-    //display any output from aws copy command
-    //io::stderr().write_all(&cp.stderr).unwrap();   
-    //io::stdout().write_all(&cp.stdout).unwrap();
     Ok(())
 }
 
-fn remove_stale_files_from_aws(aws_url: &str) -> Result<(),String> {
+fn remove_stale_files_from_aws(aws_url: &str,backups_to_keep: usize) -> Result<(),String> {
     let output = Command::new("aws")
     .arg("s3")
     .arg("ls")
@@ -127,22 +126,33 @@ fn remove_stale_files_from_aws(aws_url: &str) -> Result<(),String> {
         log::error!("command failed");
         return Err("aws ls commmand failed".to_string());
     }
-    //io::stderr().write_all(&output.stderr).unwrap();   
 
     let ls_output = String::from_utf8(output.stdout).map_err(|e| format!("ls conversion to utf8 failed:{}",e.to_string()))?;
     let mut backup_files: Vec<_> = ls_output
         .lines()
-        .map(|l| {
+        .filter_map(|l| {
             let fields: Vec<&str> = l.split_whitespace().collect();
-            let d = NaiveDate::parse_from_str(fields[0],"%Y-%m-%d").unwrap();
-            let t = NaiveTime::parse_from_str(fields[1],"%H:%M:%S").unwrap();
+            let d = match NaiveDate::parse_from_str(fields[0],"%Y-%m-%d") {
+                Err(e) => {
+                    log::error!("Error parsing date: {}",e.to_string());
+                    return None;
+                },
+                Ok(o) => o
+            };
+            let t = match NaiveTime::parse_from_str(fields[1],"%H:%M:%S") {
+                Err(e) => {
+                    log::error!("Error parsing time: {}",e.to_string());
+                    return None;
+                },
+                Ok(o) => o
+            };
             let dt = NaiveDateTime::new(d,t);
             let file = FileStruct {
                 file_date: dt,
                 file_name: fields[3].to_string(),
             };
 
-            file
+            Some(file)
         })
         .collect();
 
@@ -151,7 +161,7 @@ fn remove_stale_files_from_aws(aws_url: &str) -> Result<(),String> {
     backup_files
         .iter() 
         .rev()
-        .skip(3)
+        .skip(backups_to_keep)
         .for_each(|f| {
             if let Err(e) = remove_file(&f.file_name,&aws_url) {
                 log::error!("Error removing file from aws:{}",e.to_string());
@@ -160,12 +170,33 @@ fn remove_stale_files_from_aws(aws_url: &str) -> Result<(),String> {
     Ok(())
 }
 
+fn main_loop(mysql_user: &str, mysql_host: &str, aws_url: &str,backups_to_keep: usize) -> Result<(),String> {
+    let file_name = get_filename();
+
+    let temp_file = create_temp_file(&file_name)?;
+
+    do_backup(temp_file,&mysql_user,&mysql_host)?;
+    
+    cp_temp_to_aws(&file_name,&aws_url)?;
+    
+    remove_stale_files_from_aws(&aws_url,backups_to_keep)?;
+
+    //remove the temporary file
+    fs::remove_file(file_name).map_err(|e| format!("error removing temporary file:{}",e.to_string()))?;
+    Ok(())
+}
+
 fn main() -> Result<(),String> {
     env_logger::init();
 
     let sleep_duration = env::var("SLEEP_DURATION").unwrap_or("86400".to_string());
-    let sleep_duration: u64 = sleep_duration.parse().map_err(|_| format!("SLEEP_DURATION environment variable is not an intger"))?;
+    let sleep_duration: u64 = sleep_duration.parse().map_err(|_| format!("SLEEP_DURATION environment variable is not an integer"))?;
+    log::info!("Backup will be performed once every {} seconds.",sleep_duration);
     let sleep_duration = time::Duration::from_secs(sleep_duration);
+
+    let backups_to_keep = env::var("BACKUPS_TO_KEEP").unwrap_or("3".to_string());
+    let backups_to_keep: usize = backups_to_keep.parse().map_err(|_| format!("BACKUPS_TO_KEEP environment variable is not an integer"))?;
+    log::info!("{} backups will be kept",backups_to_keep);
 
     if env::var("MYSQL_PWD").is_err() {
         return Err("MYSQL_PWD is not set".to_string())
@@ -181,19 +212,17 @@ fn main() -> Result<(),String> {
 
 
     loop {
-        let file_name = get_filename();
-
-        let temp_file = create_temp_file(&file_name)?;
-
-        do_backup(temp_file,&mysql_user,&mysql_host)?;
-    
-        cp_temp_to_aws(&file_name,&aws_url)?;
-    
-        remove_stale_files_from_aws(&aws_url)?;
-
-
-        //remove the temporary file
-        fs::remove_file(file_name).map_err(|e| format!("error removing temporary file:{}",e.to_string()))?;
+        match main_loop(&mysql_user,&mysql_host, &aws_url,backups_to_keep) {
+            Err(e) => {
+                log::error!("{}",e);
+                log::debug!("Sleeping for 60 seconds.");
+                //wait for one minute then retry
+                let sleep_duration = time::Duration::from_secs(60);
+                thread::sleep(sleep_duration);
+                continue;
+            },
+            Ok(o) => o
+        }
         log::debug!("Sleeping for {} seconds.",sleep_duration.as_secs());
         thread::sleep(sleep_duration);
     }
