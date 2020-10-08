@@ -3,11 +3,15 @@ use std::io::prelude::*;
 use std::{
     process::{Command,Stdio},
     io::{BufReader},
+    collections::{HashMap},
+    thread,
+    time,
+    fs,
+    fs::File,
     env,
+    env::VarError::{NotUnicode,NotPresent},
 };
-use std::fs::File;
-use std::fs;
-use std::{thread, time};
+use reqwest::{StatusCode};
 
 struct FileStruct {
         file_date: NaiveDateTime,
@@ -170,7 +174,23 @@ fn remove_stale_files_from_aws(aws_url: &str,backups_to_keep: usize) -> Result<(
     Ok(())
 }
 
-fn main_loop(mysql_user: &str, mysql_host: &str, aws_url: &str,backups_to_keep: usize) -> Result<(),String> {
+fn send_to_slack(file_name: &str,slack_url: &str) -> Result<(),String> {
+    let mut data = HashMap::new();
+    data.insert("text", format!("database backed up: {}",file_name));
+
+    let client = reqwest::blocking::Client::new();
+    let res = client.post(slack_url)
+        .json(&data)
+        .send()
+        .map_err(|e| format!("Could not send to slack:{}",e.to_string()))?;
+
+    if res.status() != StatusCode::OK {
+        return Err(format!("slack call returned: {}",res.status().to_string()));
+    }
+    Ok(())
+}
+
+fn main_loop(mysql_user: &str, mysql_host: &str, aws_url: &str,backups_to_keep: usize,slack_url: &Option<String>) -> Result<(),String> {
     let file_name = get_filename();
 
     let temp_file = create_temp_file(&file_name)?;
@@ -182,7 +202,12 @@ fn main_loop(mysql_user: &str, mysql_host: &str, aws_url: &str,backups_to_keep: 
     remove_stale_files_from_aws(&aws_url,backups_to_keep)?;
 
     //remove the temporary file
-    fs::remove_file(file_name).map_err(|e| format!("error removing temporary file:{}",e.to_string()))?;
+    fs::remove_file(&file_name).map_err(|e| format!("error removing temporary file:{}",e.to_string()))?;
+
+    if let Some(su) = slack_url {
+        send_to_slack(&file_name, &su)?;
+    }
+
     Ok(())
 }
 
@@ -209,10 +234,17 @@ fn main() -> Result<(),String> {
 
     let aws_url = env::var("AWS_URL").map_err(|_| "AWS_URL is not set".to_string())?;
     let mysql_host = env::var("MYSQL_HOST").map_err(|_| "MYSQL_HOST is not set".to_string())?;
-
+    let slack_url = match env::var("SLACK_URL") {
+        Ok(s) => Some(s),
+        Err(NotPresent) => {
+            log::info!("SLACK_URL is not set");
+            None
+        },
+        Err(NotUnicode(_)) => return Err(format!("SLACK_URL env failed"))
+    };
 
     loop {
-        match main_loop(&mysql_user,&mysql_host, &aws_url,backups_to_keep) {
+        match main_loop(&mysql_user,&mysql_host, &aws_url,backups_to_keep,&slack_url) {
             Err(e) => {
                 log::error!("{}",e);
                 log::debug!("Sleeping for 60 seconds.");
