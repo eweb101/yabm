@@ -1,6 +1,8 @@
 ### Overview
 Back up all databases on a mysql server using mysqldump, gzip the backup file, then copy that file to s3.
 
+If the SLACK_URL environment variable is set, a message will be sent to slack every time a database backup is performed.
+
 ### Environment variables
 
 AWS_ACCESS_KEY_ID<br>
