@@ -11,4 +11,5 @@ MYSQL_PWD<br>
 MYSQL_USER<br>
 MYSQL_HOST<br>
 SLEEP_DURATION //How much time between backups in seconds. Default is 86400<br>
-BACKUPS_TO_KEEP //How many backup files to keep on s3. 
+BACKUPS_TO_KEEP //How many backup files to keep on s3.<br>
+SLACK_URL //Optional slack webhook url.<br>
