@@ -174,9 +174,9 @@ fn remove_stale_files_from_aws(aws_url: &str,backups_to_keep: usize) -> Result<(
     Ok(())
 }
 
-fn send_to_slack(file_name: &str,slack_url: &str) -> Result<(),String> {
+fn send_to_slack(text: &str,slack_url: &str) -> Result<(),String> {
     let mut data = HashMap::new();
-    data.insert("text", format!("database backed up: {}",file_name));
+    data.insert("text", text);
 
     let client = reqwest::blocking::Client::new();
     let res = client.post(slack_url)
@@ -205,7 +205,7 @@ fn main_loop(mysql_user: &str, mysql_host: &str, aws_url: &str,backups_to_keep: 
     fs::remove_file(&file_name).map_err(|e| format!("error removing temporary file:{}",e.to_string()))?;
 
     if let Some(su) = slack_url {
-        send_to_slack(&file_name, &su)?;
+        send_to_slack(&format!("database backed up: {}", &file_name),su)?;
     }
 
     Ok(())
@@ -247,6 +247,11 @@ fn main() -> Result<(),String> {
         match main_loop(&mysql_user,&mysql_host, &aws_url,backups_to_keep,&slack_url) {
             Err(e) => {
                 log::error!("{}",e);
+                if let Some(ref su) = slack_url {
+                    if let Err(e_slack) = send_to_slack(&e,&su) {
+                        log::error!("Could not send to slack: {}",e_slack);
+                    }
+                }
                 log::debug!("Sleeping for 60 seconds.");
                 //wait for one minute then retry
                 let sleep_duration = time::Duration::from_secs(60);
